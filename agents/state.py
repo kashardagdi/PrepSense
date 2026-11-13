@@ -32,13 +32,18 @@ class InterviewState(TypedDict, total=False):
     job_info: Dict[str, Any]
 
     # ==============================================
-    # 4. QUESTION GENERATION
+    # 4. SKILL GAP ANALYSIS
+    # ==============================================
+    skill_gap_report: Dict[str, Any]
+
+    # ==============================================
+    # 5. QUESTION GENERATION
     # ==============================================
     questions: List[Dict[str, Any]]
     questions_validated: bool
 
     # ==============================================
-    # 5. ANSWER EVALUATION
+    # 6. ANSWER EVALUATION
     # ==============================================
 
     selected_question: Dict[str, Any]
@@ -46,7 +51,7 @@ class InterviewState(TypedDict, total=False):
     feedback: Dict[str, Any]
 
     # ==============================================
-    # 6. EXECUTION TRACKING
+    # 7. EXECUTION TRACKING
     # ==============================================
 
     current_step: str
