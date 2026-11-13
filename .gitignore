@@ -13,3 +13,7 @@ __pycache__/
 
 # IDE settings
 .vscode/
+
+# Local cache & accounts
+.session_cache.json
+.prepsense_accounts.json

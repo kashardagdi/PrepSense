@@ -29,10 +29,21 @@ def _get_llm() -> ChatOllama:
 
 def ask_ai(prompt: str, **kwargs) -> str:
     """Send a prompt to the local model and measure inference."""
+
     client = _get_llm()
-    response = client.invoke(prompt)
+
+    # Enable constrained JSON output when requested.
+    output_format = kwargs.get("format")
+
+    if output_format:
+        response = client.bind(format=output_format).invoke(prompt)
+    else:
+        response = client.invoke(prompt)
+
     metadata = response.response_metadata
+
     print("\n--- OLLAMA PERFORMANCE ---")
+
     for key in [
         "load_duration",
         "prompt_eval_count",
@@ -42,10 +53,14 @@ def ask_ai(prompt: str, **kwargs) -> str:
         "total_duration",
     ]:
         value = metadata.get(key)
+
         if key.endswith("_duration") and isinstance(value, (int, float)):
             value = f"{value / 1_000_000_000:.2f} seconds"
+
         print(f"{key}: {value}")
+
     print("--------------------------\n")
+
     return response.content
 
 

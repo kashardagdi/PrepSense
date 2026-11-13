@@ -89,8 +89,82 @@ def _extract_questions_from_any(data) -> list:
     return valid
 
 
+def _repair_truncated_json(text: str) -> dict | list | None:
+    """
+    Salvage a JSON string cut off mid-generation by finding the largest prefix
+    ending at '}' that forms valid JSON once unclosed brackets are closed.
+    """
+    if not text:
+        return None
+
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] != "}":
+            continue
+        prefix = text[:i + 1]
+        stack = []
+        in_string = False
+        escape = False
+        valid = True
+        for ch in prefix:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch in "{[":
+                stack.append(ch)
+            elif ch == "}":
+                if not stack or stack[-1] != "{":
+                    valid = False
+                    break
+                stack.pop()
+            elif ch == "]":
+                if not stack or stack[-1] != "[":
+                    valid = False
+                    break
+                stack.pop()
+        if not valid or in_string:
+            continue
+        suffix = ""
+        for opener in reversed(stack):
+            suffix += "}" if opener == "{" else "]"
+        candidate = prefix + suffix
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _extract_individual_json_question_objects(text: str) -> list:
+    """
+    Regex fallback: extracts any completed {"question": ..., "type": ...}
+    objects directly from raw or damaged text.
+    """
+    pattern = r'\{\s*"question"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"\s*,\s*"type"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"(?:\s*,\s*"reason"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)")?\s*\}'
+    matches = re.findall(pattern, text)
+    results = []
+    for i, m in enumerate(matches, 1):
+        q_text = m[0].strip()
+        q_type = m[1].strip().lower()
+        if q_type not in ("technical", "behavioral"):
+            q_type = "behavioral" if i > 5 else "technical"
+        reason = m[2].strip() if len(m) > 2 and m[2] else "Relevant role requirement."
+        if len(q_text) > 8:
+            results.append({"question": q_text, "type": q_type, "reason": reason})
+    return results
+
+
 def robust_parse_questions(text: str) -> list:
-    """Safely parse questions from JSON, Markdown code fences, or numbered lists."""
+    """Safely parse questions from JSON, Markdown code fences, partial JSON, or numbered lists."""
     if not text or not text.strip():
         return []
 
@@ -114,7 +188,21 @@ def robust_parse_questions(text: str) -> list:
     except Exception:
         pass
 
-    # Attempt 3: Regex extract numbered list
+    # Attempt 3: Truncated JSON recovery
+    repaired = _repair_truncated_json(cleaned) or _repair_truncated_json(text)
+    if repaired:
+        questions = _extract_questions_from_any(repaired)
+        if questions:
+            print(f"[Recovery] Salvaged {len(questions)} questions from truncated JSON.")
+            return questions
+
+    # Attempt 4: Regex individual question object extraction
+    regex_questions = _extract_individual_json_question_objects(text)
+    if regex_questions:
+        print(f"[Recovery] Extracted {len(regex_questions)} question objects via pattern matching.")
+        return regex_questions
+
+    # Attempt 5: Regex extract numbered list
     pattern = r"(?:^|\n)\s*(?:\d+[\.\)]|Question\s*\d+:?)\s*([^\n]+(?:\n(?!\s*(?:\d+[\.\)]|Question\s*\d+:?))[^\n]+)*)"
     matches = re.findall(pattern, text)
 
@@ -266,87 +354,62 @@ def generate_questions(
         raise ValueError("Resume text must be a string.")
 
     # ----------------------------------------------
-    # 1. Prepare candidate context
+    # 1. Prepare concise candidate & company context
     # ----------------------------------------------
 
     if resume_text.strip():
-        candidate_context = resume_text.strip()[:MAX_RESUME_CHARS]
+        candidate_context = resume_text.strip()[:1000]
     else:
         candidate_context = "No resume information provided."
+
+    company_context = (
+        company_research.strip()[:400]
+        if company_research.strip()
+        else "Technology company."
+    )
+
+    job_summary = {
+        "job_title": job_info.get("job_title", ""),
+        "technical_skills": job_info.get("technical_skills", [])[:6],
+        "tools_and_technologies": job_info.get("tools_and_technologies", [])[:4],
+    }
 
     # ----------------------------------------------
     # 2. Generate initial questions
     # ----------------------------------------------
 
-    prompt = f"""
-    /no_think
+    prompt = f"""You are an interview preparation assistant for PrepSense.
 
-    You are an interview preparation assistant for PrepSense.
+Generate exactly 8 personalized interview questions:
+- Exactly 5 technical questions (focused on candidate's technical skills & job requirements).
+- Exactly 3 behavioral questions (focused on teamwork, challenge resolution, company culture).
 
-    Generate exactly 8 personalized interview questions.
-
-    REQUIRED DISTRIBUTION:
-    - Exactly 5 technical questions.
-    - Exactly 3 behavioral questions.
-
-    PERSONALIZATION RULES:
-
-- Use the job information, company research and resume.
-- Connect demonstrated candidate experience with job requirements.
-
-RESUME-GROUNDING RULES:
-
-1. Treat the resume as the only source of information
-   about the candidate's past experience and achievements.
-
-2. Only ask "How have you..." or "Describe your experience..."
-   when the resume explicitly establishes that experience.
-
-3. If a technology appears in the resume's project or
-   experience section, you may ask about its actual use.
-
-4. If a technology appears only in the resume's skills
-   section, ask about familiarity or knowledge rather
-   than assuming project experience.
-
-5. If a technology appears only in the job description
-   and not in the resume, use hypothetical questions
-   such as "How would you..." or "How would you approach...".
-
-6. Never invent candidate projects, responsibilities,
-   achievements, tools used or professional experience.
-
-7. Do not infer that the candidate used a technology
-   simply because it is required by the job description.
-
-OTHER RULES:
-
-- Generate distinct technical and behavioral questions.
-- Avoid duplicate or repetitive questions.
-- Every question must have a meaningful relevance reason.
+GUIDELINES:
+- Base technical questions on technologies in the candidate's resume or job requirements.
+- Keep each question concise (1-2 sentences).
+- Keep "reason" ultra-concise (under 10 words, e.g. "Tests candidate's experience with Python.").
 - Do not provide answers.
 
-    Return ONLY valid JSON in this structure:
+Target Role & Skills:
+{json.dumps(job_summary, ensure_ascii=False)}
 
-    {{
-        "questions": [
-            {{
-                "question": "Question text",
-                "type": "technical",
-                "reason": "Why this question is relevant"
-            }}
-        ]
-    }}
+Company Background:
+{company_context}
 
-    Job information:
-    {json.dumps(job_info, indent=2)}
+Candidate Experience:
+{candidate_context}
 
-    Company research:
-    {company_research[:3000]}
-
-    Candidate resume:
-    {candidate_context}
-    """
+Return ONLY a valid JSON object in this exact format:
+{{
+    "questions": [
+        {{
+            "question": "Question text here?",
+            "type": "technical",
+            "reason": "Brief reason under 10 words"
+        }}
+    ]
+}}
+"""
 
     print("\nAsking Qwen to generate initial questions...")
 
@@ -413,61 +476,44 @@ OTHER RULES:
             question["question"] for question in questions
         ]
 
-        repair_prompt = f"""
-        /no_think
+        repair_prompt = f"""You are repairing an incomplete interview question set.
 
-        You are repairing an incomplete interview question set.
+Generate ONLY the missing interview questions.
 
-        Generate ONLY the missing interview questions.
+REQUIRED MISSING QUESTIONS:
+- Technical: {missing['technical']}
+- Behavioral: {missing['behavioral']}
+- Total: {total_missing}
 
-        REQUIRED MISSING QUESTIONS:
-        - Technical: {missing['technical']}
-        - Behavioral: {missing['behavioral']}
-        - Total: {total_missing}
+Existing questions (DO NOT REPEAT THESE):
+{json.dumps(existing_questions, indent=2)}
 
-        Existing questions (DO NOT REPEAT THESE):
-        {json.dumps(existing_questions, indent=2)}
+Target Role & Skills:
+{json.dumps(job_summary, ensure_ascii=False)}
 
-        Job information:
-        {json.dumps(job_info, indent=2)}
+Company Background:
+{company_context}
 
-        Company research:
-        {company_research[:2000]}
+Candidate Experience:
+{candidate_context}
 
-        Candidate resume:
-        {candidate_context}
+RULES:
+- Generate exactly the requested missing question counts.
+- Keep each question concise (1-2 sentences).
+- Keep "reason" ultra-concise (under 10 words).
+- Do not repeat existing questions.
 
-        RULES:
-
-        - Generate exactly the requested missing question counts.
-        - Use the correct type for every question.
-        - Do not repeat existing questions.
-        - Use the candidate resume as the source of truth
-          for past experience and achievements.
-        - If a technology appears in a resume project or
-          work experience, you may ask about its actual use.
-        - If a technology appears only in the resume skills
-          section, ask about familiarity or knowledge.
-        - If a technology appears only in the job description,
-          ask hypothetical questions using "How would you..."
-          rather than assuming previous experience.
-        - Never invent candidate projects, responsibilities
-          or achievements.
-        - Give every question a meaningful relevance reason.
-        - Do not provide answers.
-
-        Return ONLY valid JSON:
-
+Return ONLY valid JSON:
+{{
+    "questions": [
         {{
-            "questions": [
-                {{
-                    "question": "Question text",
-                    "type": "technical",
-                    "reason": "Why this question is relevant"
-                }}
-            ]
+            "question": "Question text?",
+            "type": "technical",
+            "reason": "Brief reason under 10 words"
         }}
-        """
+    ]
+}}
+"""
 
         repaired_response = ask_ai(repair_prompt)
 
