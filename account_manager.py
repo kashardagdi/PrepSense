@@ -18,7 +18,12 @@ def _get_accounts_file() -> Path:
     """Get preferred writable accounts cache file path."""
     local_path = Path(__file__).parent / ".prepsense_accounts.json"
     try:
-        local_path.touch(exist_ok=True)
+        if local_path.exists():
+            with open(local_path, "a", encoding="utf-8") as f:
+                pass
+        else:
+            with open(local_path, "w", encoding="utf-8") as f:
+                pass
         return local_path
     except Exception:
         return Path(tempfile.gettempdir()) / "prepsense_accounts.json"
@@ -39,6 +44,9 @@ def _create_default_profile(user_id: str = DEFAULT_USER_ID, name: str = "Candida
             "total_interviews": 0,
             "total_skill_analyses": 0,
             "total_roadmaps_created": 0,
+            "total_followups_practiced": 0,
+            "total_coding_submissions": 0,
+            "total_coding_solved": 0,
             "average_score": 0.0,
             "scores_history": [],
         },
@@ -47,87 +55,111 @@ def _create_default_profile(user_id: str = DEFAULT_USER_ID, name: str = "Candida
 
 
 def load_accounts_db() -> Dict[str, Any]:
-    """Load the full accounts database from storage."""
-    file_path = _get_accounts_file()
-    if not file_path.exists():
-        default_db = {
-            "active_user_id": DEFAULT_USER_ID,
-            "accounts": {DEFAULT_USER_ID: _create_default_profile(DEFAULT_USER_ID, "Candidate")},
-        }
-        save_accounts_db(default_db)
-        return default_db
+    """Load accounts database from JSON file with resilient error handling."""
+    candidates = [_get_accounts_file(), Path(__file__).parent / ".prepsense_accounts.json", Path(tempfile.gettempdir()) / "prepsense_accounts.json"]
+    for target_file in candidates:
+        if target_file.exists():
+            try:
+                data = json.loads(target_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "accounts" in data and data["accounts"]:
+                    if "active_user_id" not in data:
+                        data["active_user_id"] = DEFAULT_USER_ID
+                    return data
+            except Exception:
+                continue
 
+    initial_db = {
+        "active_user_id": DEFAULT_USER_ID,
+        "accounts": {
+            DEFAULT_USER_ID: _create_default_profile(),
+        },
+    }
+    save_accounts_db(initial_db)
+    return initial_db
+
+
+def save_accounts_db(db: Dict[str, Any]) -> None:
+    """Save accounts database safely with multi-path resilience."""
+    target_file = _get_accounts_file()
+    payload = json.dumps(db, indent=2, ensure_ascii=False)
+    saved = False
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict) or "accounts" not in data:
-            default_db = {
-                "active_user_id": DEFAULT_USER_ID,
-                "accounts": {DEFAULT_USER_ID: _create_default_profile(DEFAULT_USER_ID, "Candidate")},
-            }
-            save_accounts_db(default_db)
-            return default_db
-        return data
-    except Exception as err:
-        print(f"[AccountManager] Failed to load accounts DB: {err}")
-        return {
-            "active_user_id": DEFAULT_USER_ID,
-            "accounts": {DEFAULT_USER_ID: _create_default_profile(DEFAULT_USER_ID, "Candidate")},
-        }
+        target_file.write_text(payload, encoding="utf-8")
+        saved = True
+    except Exception as e:
+        print(f"[AccountManager] Primary persist failed: {e}. Trying temp fallback.")
 
-
-def save_accounts_db(data: Dict[str, Any]) -> bool:
-    """Persist the accounts database to storage."""
-    file_path = _get_accounts_file()
+    # Always ensure temp backup stays in sync
     try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as err:
-        print(f"[AccountManager] Failed to save accounts DB: {err}")
-        return False
+        fallback = Path(tempfile.gettempdir()) / "prepsense_accounts.json"
+        if fallback != target_file:
+            fallback.write_text(payload, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_all_accounts() -> Dict[str, Dict[str, Any]]:
+    """Return all stored candidate accounts."""
+    db = load_accounts_db()
+    return db.get("accounts", {})
 
 
 def get_active_account() -> Dict[str, Any]:
-    """Retrieve the currently active user account."""
+    """Return the currently selected user profile."""
     db = load_accounts_db()
     active_id = db.get("active_user_id", DEFAULT_USER_ID)
-    accounts = db.get("accounts", {})
+    accounts = db.setdefault("accounts", {})
     if active_id not in accounts:
         accounts[active_id] = _create_default_profile(active_id, "Candidate")
         save_accounts_db(db)
     return accounts[active_id]
 
 
-def switch_or_create_account(
-    username: str,
-    name: Optional[str] = None,
-    target_role: Optional[str] = None
+def update_account_profile(
+    user_id: str,
+    name: str = "",
+    target_role: str = "",
 ) -> Dict[str, Any]:
-    """Switch to an existing account by username or create a new one."""
-    user_id = username.strip().casefold().replace(" ", "_")
-    if not user_id:
-        user_id = DEFAULT_USER_ID
+    """Update profile metadata (name, target role) without switching accounts."""
+    clean_id = user_id.strip().lower().replace(" ", "_") or DEFAULT_USER_ID
+    db = load_accounts_db()
+    accounts = db.setdefault("accounts", {})
+    if clean_id in accounts:
+        if name.strip():
+            accounts[clean_id]["name"] = name.strip()
+        if target_role.strip():
+            accounts[clean_id]["target_role"] = target_role.strip()
+        save_accounts_db(db)
+        return accounts[clean_id]
+    return get_active_account()
 
+
+def switch_or_create_account(
+    user_id: str,
+    name: str = "",
+    target_role: str = "",
+) -> Dict[str, Any]:
+    """Switch active profile or create a new candidate account."""
+    clean_id = user_id.strip().lower().replace(" ", "_") or DEFAULT_USER_ID
     db = load_accounts_db()
     accounts = db.setdefault("accounts", {})
 
-    if user_id in accounts:
-        account = accounts[user_id]
-        if name and name.strip():
-            account["name"] = name.strip()
-        if target_role and target_role.strip():
-            account["target_role"] = target_role.strip()
+    if clean_id not in accounts:
+        accounts[clean_id] = _create_default_profile(
+            user_id=clean_id,
+            name=name.strip() or clean_id.capitalize(),
+        )
+        if target_role.strip():
+            accounts[clean_id]["target_role"] = target_role.strip()
     else:
-        display_name = name.strip() if name and name.strip() else username.strip().title()
-        account = _create_default_profile(user_id, display_name)
-        if target_role and target_role.strip():
-            account["target_role"] = target_role.strip()
-        accounts[user_id] = account
+        if name.strip():
+            accounts[clean_id]["name"] = name.strip()
+        if target_role.strip():
+            accounts[clean_id]["target_role"] = target_role.strip()
 
-    db["active_user_id"] = user_id
+    db["active_user_id"] = clean_id
     save_accounts_db(db)
-    return account
+    return accounts[clean_id]
 
 
 def record_user_answer_input(
@@ -136,9 +168,7 @@ def record_user_answer_input(
     company: str = "",
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Increment total candidate answer inputs and update performance stats.
-    """
+    """Record an answer evaluation submission and update candidate statistics."""
     db = load_accounts_db()
     target_id = user_id or db.get("active_user_id", DEFAULT_USER_ID)
     accounts = db.setdefault("accounts", {})
@@ -147,29 +177,26 @@ def record_user_answer_input(
         accounts[target_id] = _create_default_profile(target_id, "Candidate")
 
     account = accounts[target_id]
-    stats = account.setdefault("stats", {
-        "total_inputs": 0,
-        "total_interviews": 0,
-        "total_skill_analyses": 0,
-        "total_roadmaps_created": 0,
-        "average_score": 0.0,
-        "scores_history": [],
-    })
+    stats = account.setdefault("stats", {})
 
+    # Increment inputs counter
     stats["total_inputs"] = stats.get("total_inputs", 0) + 1
+
+    # Record score history and recalculate lifetime average
     scores = stats.setdefault("scores_history", [])
     scores.append(round(float(score), 1))
-    stats["average_score"] = round(sum(scores) / len(scores), 1)
+    stats["average_score"] = round(sum(scores) / len(scores), 2) if scores else 0.0
 
+    # Add to recent activity log
     activity = account.setdefault("recent_activity", [])
     activity.insert(0, {
-        "action": "Answer Evaluated",
-        "detail": f"{company + ' · ' if company else ''}{question[:60]}... → Score: {score}/10",
-        "timestamp": datetime.now().strftime("%b %d, %H:%M"),
+        "type": "answer_evaluated",
+        "question": question[:80],
         "score": score,
+        "company": company,
+        "timestamp": datetime.now().isoformat(),
     })
-    # Keep last 25 activities
-    account["recent_activity"] = activity[:25]
+    account["recent_activity"] = activity[:20]
 
     save_accounts_db(db)
     return account
@@ -180,7 +207,7 @@ def record_interview_created(
     role: str = "",
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Record creation of a new personalized interview session."""
+    """Record creation of a new interview session."""
     db = load_accounts_db()
     target_id = user_id or db.get("active_user_id", DEFAULT_USER_ID)
     accounts = db.setdefault("accounts", {})
@@ -192,13 +219,17 @@ def record_interview_created(
     stats = account.setdefault("stats", {})
     stats["total_interviews"] = stats.get("total_interviews", 0) + 1
 
+    if role and not account.get("target_role"):
+        account["target_role"] = role
+
     activity = account.setdefault("recent_activity", [])
     activity.insert(0, {
-        "action": "Interview Created",
-        "detail": f"{company}{f' ({role})' if role else ''}",
-        "timestamp": datetime.now().strftime("%b %d, %H:%M"),
+        "type": "interview_created",
+        "company": company,
+        "role": role,
+        "timestamp": datetime.now().isoformat(),
     })
-    account["recent_activity"] = activity[:25]
+    account["recent_activity"] = activity[:20]
 
     save_accounts_db(db)
     return account
@@ -208,7 +239,7 @@ def record_skill_analysis_run(
     company: str,
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Record execution of a skill-gap analysis."""
+    """Record execution of Resume-JD skill-gap analysis."""
     db = load_accounts_db()
     target_id = user_id or db.get("active_user_id", DEFAULT_USER_ID)
     accounts = db.setdefault("accounts", {})
@@ -222,11 +253,11 @@ def record_skill_analysis_run(
 
     activity = account.setdefault("recent_activity", [])
     activity.insert(0, {
-        "action": "Skill Gap Analyzed",
-        "detail": f"Resume compared against {company} requirements",
-        "timestamp": datetime.now().strftime("%b %d, %H:%M"),
+        "type": "skill_analysis_run",
+        "company": company,
+        "timestamp": datetime.now().isoformat(),
     })
-    account["recent_activity"] = activity[:25]
+    account["recent_activity"] = activity[:20]
 
     save_accounts_db(db)
     return account
@@ -247,6 +278,70 @@ def record_roadmap_generated(
     account = accounts[target_id]
     stats = account.setdefault("stats", {})
     stats["total_roadmaps_created"] = stats.get("total_roadmaps_created", 0) + 1
+
+    save_accounts_db(db)
+    return account
+
+
+def record_adaptive_followup(
+    original_question: str,
+    followup_question: str,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record an adaptive follow-up generation."""
+    db = load_accounts_db()
+    target_id = user_id or db.get("active_user_id", DEFAULT_USER_ID)
+    accounts = db.setdefault("accounts", {})
+
+    if target_id not in accounts:
+        accounts[target_id] = _create_default_profile(target_id, "Candidate")
+
+    account = accounts[target_id]
+    stats = account.setdefault("stats", {})
+    stats["total_followups_practiced"] = stats.get("total_followups_practiced", 0) + 1
+
+    activity = account.setdefault("recent_activity", [])
+    activity.insert(0, {
+        "type": "adaptive_followup",
+        "question": original_question[:80],
+        "followup": followup_question[:80],
+        "timestamp": datetime.now().isoformat(),
+    })
+    account["recent_activity"] = activity[:20]
+
+    save_accounts_db(db)
+    return account
+
+
+def record_coding_challenge_completed(
+    challenge_title: str,
+    all_passed: bool,
+    quality_score: int,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record a coding challenge execution and review."""
+    db = load_accounts_db()
+    target_id = user_id or db.get("active_user_id", DEFAULT_USER_ID)
+    accounts = db.setdefault("accounts", {})
+
+    if target_id not in accounts:
+        accounts[target_id] = _create_default_profile(target_id, "Candidate")
+
+    account = accounts[target_id]
+    stats = account.setdefault("stats", {})
+    stats["total_coding_submissions"] = stats.get("total_coding_submissions", 0) + 1
+    if all_passed:
+        stats["total_coding_solved"] = stats.get("total_coding_solved", 0) + 1
+
+    activity = account.setdefault("recent_activity", [])
+    activity.insert(0, {
+        "type": "coding_challenge",
+        "challenge": challenge_title,
+        "all_passed": all_passed,
+        "quality_score": quality_score,
+        "timestamp": datetime.now().isoformat(),
+    })
+    account["recent_activity"] = activity[:20]
 
     save_accounts_db(db)
     return account

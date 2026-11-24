@@ -135,6 +135,33 @@ class TestQuestionRepair(unittest.TestCase):
         self.assertEqual(mock_ai.call_count, 2)
         print("\nPASS: A duplicate repair question was not accepted.")
 
+    @patch("question_generator.ask_ai")
+    def test_allow_fallback_synthesizes_missing_questions(self, mock_ai):
+        # Scenario: initial gives 3 tech, 0 beh. Repair gives 1 tech, 2 beh (total 4 tech, 2 beh)
+        initial_response = json.dumps(create_questions(3, 0))
+        repair_response = json.dumps(create_questions(1, 2))
+        mock_ai.side_effect = [initial_response, repair_response]
+
+        job_info = {
+            "job_title": "Software Engineer",
+            "technical_skills": ["Python", "SQL", "REST APIs"],
+            "tools_and_technologies": ["Git", "Docker"],
+        }
+
+        result = generate_questions(
+            job_info=job_info,
+            company_research="Zerodha is a fintech platform.",
+            resume_text="Experienced in Python and SQL.",
+            allow_fallback=True,
+        )
+
+        self.assertEqual(len(result), 8)
+        technical = sum(q["type"] == "technical" for q in result)
+        behavioral = sum(q["type"] == "behavioral" for q in result)
+        self.assertEqual(technical, 5)
+        self.assertEqual(behavioral, 3)
+        print("\nPASS: Fallback successfully synthesized missing questions to guarantee 5 technical + 3 behavioral.")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
