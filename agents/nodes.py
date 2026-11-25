@@ -145,6 +145,7 @@ def generate_questions_node(state: InterviewState) -> dict:
         job_info=job_info,
         company_research=company_research,
         resume_text=resume_text,
+        allow_fallback=True,
     )
     elapsed = time.perf_counter() - start
     print(f"[LangGraph Node] Generated {len(questions)} questions in {elapsed:.2f}s")
@@ -167,8 +168,18 @@ def validate_questions_node(state: InterviewState) -> dict:
     # Step 1: Read generated questions from shared state
     questions = state.get("questions", [])
 
-    # Step 2: Validate the questions
-    validated_questions = validate_question_set(questions)
+    # Step 2: Validate the questions (with rescue fallback if anything was missed)
+    try:
+        validated_questions = validate_question_set(questions)
+    except Exception as e:
+        print(f"[LangGraph Node] Incomplete question set detected ({e}). Rescuing with role-aware synthesis...")
+        from question_generator import synthesize_missing_questions
+        questions = synthesize_missing_questions(
+            current_questions=questions,
+            job_info=state.get("job_info", {}),
+            company_research=state.get("company_research", ""),
+        )
+        validated_questions = validate_question_set(questions)
 
     # Step 3: Update shared state after successful validation
     print("[LangGraph Node] Question validation successful.")

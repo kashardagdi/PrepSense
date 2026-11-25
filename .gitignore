@@ -15,5 +15,5 @@ __pycache__/
 .vscode/
 
 # Local cache & accounts
-.session_cache.json
-.prepsense_accounts.json
+.session_cache*.json
+.prepsense_accounts*.json

@@ -6,14 +6,27 @@ import streamlit as st
 from pipeline import prepare_interview, analyze_candidate_skill_gap, generate_candidate_roadmap
 from answer_evaluator import evaluate_answer
 from roadmap_generator import roadmap_to_markdown
-from session_manager import save_session_cache, load_session_cache, clear_session_cache
+from adaptive_followup import generate_adaptive_followup
+from code_runner import run_coding_test_cases, review_code_solution, CODING_CHALLENGES
+from report_generator import build_report_html, build_report_filename
+from session_manager import (
+    save_session_cache,
+    load_session_cache,
+    clear_session_cache,
+    clear_session_state_for_switch,
+    restore_session_into_state,
+)
 from account_manager import (
     get_active_account,
+    get_all_accounts,
     switch_or_create_account,
+    update_account_profile,
     record_user_answer_input,
     record_interview_created,
     record_skill_analysis_run,
     record_roadmap_generated,
+    record_adaptive_followup,
+    record_coding_challenge_completed,
 )
 
 
@@ -31,11 +44,11 @@ st.set_page_config(
 NAV_ITEMS = [
     "Overview",
     "Interview Practice",
-    "Skill Gap Analysis",
     "Performance Analytics",
     "Learning Roadmap",
     "Adaptive Follow-ups",
     "Coding Interview",
+    "Interview Report",
 ]
 
 
@@ -53,6 +66,11 @@ def initialize_state() -> None:
         "roadmap_completed": set(),
         "learning_roadmap": None,
         "nav_history": [],
+        "adaptive_followups": {},
+        "coding_sessions": {},
+        "all_attempts_history": {},
+        "coding_test_results": {},
+        "coding_reviews": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -60,18 +78,12 @@ def initialize_state() -> None:
 
     # Automatically restore active session from persistent cache if available
     if st.session_state.interview_result is None:
-        cached = load_session_cache()
-        if cached and cached.get("interview_result"):
-            for k, v in cached.items():
-                if k in st.session_state and v is not None:
-                    st.session_state[k] = v
-            # Restore candidate draft answers and attempt counts
-            for ans_k, ans_v in cached.get("candidate_answers", {}).items():
-                if ans_k not in st.session_state or not st.session_state[ans_k]:
-                    st.session_state[ans_k] = ans_v
-            for att_k, att_v in cached.get("attempt_counts", {}).items():
-                if att_k not in st.session_state:
-                    st.session_state[att_k] = att_v
+        try:
+            active = get_active_account()
+            active_uid = active.get("id") if active else None
+        except Exception:
+            active_uid = None
+        restore_session_into_state(st.session_state, user_id=active_uid)
 
 
 initialize_state()
@@ -579,8 +591,12 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    if "account_banner" in st.session_state:
+        st.success(st.session_state.pop("account_banner"))
+
     active_account = get_active_account()
     acc_stats = active_account.get("stats", {})
+    curr_id = active_account.get("id", "default_candidate")
 
     with st.container(border=True):
         acc_col1, acc_col2 = st.columns([1, 2.5])
@@ -600,15 +616,73 @@ with st.sidebar:
         if acc_stats.get("scores_history"):
             st.caption(f"⭐ **{acc_stats.get('average_score', 0.0)}/10** avg score")
 
-        with st.expander("👤 Account Profile / Switch"):
-            with st.form("switch_account_form", clear_on_submit=False):
-                new_uname = st.text_input("Username / ID", value=active_account.get("id", ""))
-                new_name = st.text_input("Candidate Name", value=active_account.get("name", ""))
-                new_role = st.text_input("Target Role", value=active_account.get("target_role", ""))
-                if st.form_submit_button("Save & Switch", use_container_width=True):
-                    if new_uname.strip():
-                        switch_or_create_account(new_uname, new_name, new_role)
-                        st.success("Account active!")
+        with st.expander("👤 Account Switch & Settings"):
+            all_accounts = get_all_accounts()
+            account_keys = list(all_accounts.keys())
+
+            tab_switch, tab_new, tab_edit = st.tabs(["🔄 Switch", "➕ New", "✏️ Edit"])
+
+            with tab_switch:
+                if len(account_keys) > 1:
+                    def _format_acc(aid: str) -> str:
+                        acc = all_accounts.get(aid, {})
+                        aname = acc.get("name", aid.capitalize())
+                        inputs = acc.get("stats", {}).get("total_inputs", 0)
+                        return f"{aid} ({aname} · {inputs} inputs)"
+
+                    curr_idx = account_keys.index(curr_id) if curr_id in account_keys else 0
+                    chosen_id = st.selectbox(
+                        "Registered Profiles",
+                        options=account_keys,
+                        index=curr_idx,
+                        format_func=_format_acc,
+                        key="sidebar_acc_dropdown",
+                    )
+                    if st.button("Switch Account →", type="primary", use_container_width=True, key="btn_switch_acc"):
+                        if chosen_id != curr_id:
+                            # 1. Save outgoing session
+                            save_session_cache(st.session_state, user_id=curr_id)
+                            # 2. Switch active user
+                            switch_or_create_account(chosen_id)
+                            # 3. Swap in-memory session state
+                            clear_session_state_for_switch(st.session_state)
+                            restore_session_into_state(st.session_state, user_id=chosen_id)
+                            target_name = all_accounts.get(chosen_id, {}).get("name", chosen_id)
+                            st.session_state["account_banner"] = f"✅ Switched to **{target_name}** (`{chosen_id}`). Workspace loaded!"
+                            st.rerun()
+                        else:
+                            st.info("Already active on this account.")
+                else:
+                    st.caption("Only 1 account exists. Use '➕ New' tab to register another candidate profile.")
+
+            with tab_new:
+                with st.form("create_new_account_form", clear_on_submit=True):
+                    new_id_input = st.text_input("Username / ID", placeholder="e.g. alex_dev", key="new_acc_id_input")
+                    new_name_input = st.text_input("Candidate Name", placeholder="e.g. Alex Rivera", key="new_acc_name_input")
+                    new_role_input = st.text_input("Target Role", placeholder="e.g. Backend Software Engineer", key="new_acc_role_input")
+                    if st.form_submit_button("Create & Switch →", type="primary", use_container_width=True):
+                        clean_new_id = new_id_input.strip().lower().replace(" ", "_")
+                        if not clean_new_id:
+                            st.warning("Please provide a valid Username / ID.")
+                        else:
+                            save_session_cache(st.session_state, user_id=curr_id)
+                            switch_or_create_account(
+                                user_id=clean_new_id,
+                                name=new_name_input.strip(),
+                                target_role=new_role_input.strip(),
+                            )
+                            clear_session_state_for_switch(st.session_state)
+                            display_name = new_name_input.strip() or clean_new_id.capitalize()
+                            st.session_state["account_banner"] = f"🎉 New profile **{display_name}** created and active!"
+                            st.rerun()
+
+            with tab_edit:
+                with st.form("edit_profile_form", clear_on_submit=False):
+                    edit_name = st.text_input("Candidate Name", value=active_account.get("name", ""), key="edit_name_input")
+                    edit_role = st.text_input("Target Role", value=active_account.get("target_role", ""), key="edit_role_input")
+                    if st.form_submit_button("Save Profile Changes", use_container_width=True):
+                        update_account_profile(curr_id, name=edit_name.strip(), target_role=edit_role.strip())
+                        st.session_state["account_banner"] = f"💾 Profile updated for **{curr_id}**."
                         st.rerun()
 
     st.caption("YOUR WORKSPACE")
@@ -688,6 +762,11 @@ if selected_page == "Overview":
         with p_col4:
             render_stat("LIFETIME AVG", f"{acc_stats.get('average_score', 0.0)}/10" if acc_stats.get("scores_history") else "—")
 
+    rep_btn_col1, rep_btn_col2 = st.columns([2.5, 1.5])
+    with rep_btn_col2:
+        if st.button("📄 Generate & Export PDF Report →", key="overview_export_report_btn", use_container_width=True):
+            navigate_to("Interview Report")
+
     evaluations = get_current_evaluations()
     total_questions = len(result.get("questions", [])) if result else 0
     evaluated_count = len(evaluations)
@@ -724,17 +803,18 @@ if selected_page == "Overview":
                 navigate_to("Interview Practice")
     with action_cols[1]:
         with st.container(border=True):
-            st.markdown("#### 🔍 Skill gap analysis")
-            st.caption("Compare your resume with the role requirements whenever you are ready.")
-            if st.button("Open skill gap analysis →", key="overview_skill_gap", use_container_width=True):
-                navigate_to("Skill Gap Analysis")
+            st.markdown("#### 🗺️ Learning roadmap")
+            st.caption("Turn identified skill gaps and role requirements into a structured, phased preparation path.")
+            if st.button("Open learning roadmap →", key="overview_roadmap", use_container_width=True):
+                navigate_to("Learning Roadmap")
 
     st.markdown("### Your preparation toolkit")
     feature_data = [
         ("📊", "Performance analytics", "Track answer scores, rubric strengths and areas to improve.", "Performance Analytics", "Available"),
         ("🗺️", "Learning roadmap", "Turn identified skill gaps into a structured, phased preparation path.", "Learning Roadmap", "Available"),
-        ("🧠", "Adaptive follow-ups", "Practise deeper follow-up questions based on your responses.", "Adaptive Follow-ups", "Backend integration pending"),
-        ("💻", "Coding interview", "Work through role-relevant coding challenges in an editor.", "Coding Interview", "Backend integration pending"),
+        ("🧠", "Adaptive follow-ups", "Practise deeper follow-up questions tailored to what you answered.", "Adaptive Follow-ups", "Available"),
+        ("💻", "Coding interview", "Solve algorithmic challenges with real test cases and AI code reviews.", "Coding Interview", "Available"),
+        ("📄", "Interview report", "Download a full PDF-ready report: scores, skill gaps, roadmap and activity history.", "Interview Report", "Available"),
     ]
     feature_cols = st.columns(2)
     for index, (icon, title, copy, destination, status) in enumerate(feature_data):
@@ -784,14 +864,14 @@ elif selected_page == "Interview Practice":
 
             shortcut_cols = st.columns(3)
             with shortcut_cols[0]:
-                if st.button("🔍 Open Skill Gap Analysis →", use_container_width=True):
-                    navigate_to("Skill Gap Analysis")
-            with shortcut_cols[1]:
                 if st.button("🗺️ Open Learning Roadmap →", use_container_width=True):
                     navigate_to("Learning Roadmap")
-            with shortcut_cols[2]:
+            with shortcut_cols[1]:
                 if st.button("📊 Open Performance Analytics →", use_container_width=True):
                     navigate_to("Performance Analytics")
+            with shortcut_cols[2]:
+                if st.button("🧠 Adaptive Follow-ups →", use_container_width=True):
+                    navigate_to("Adaptive Follow-ups")
 
     # Form to configure or start a new session (collapsed if a session is already active)
     with st.expander("➕ Configure or start a new interview session", expanded=(result is None)):
@@ -955,6 +1035,16 @@ elif selected_page == "Interview Practice":
                             st.session_state.last_evaluated_question_index = index
                             st.session_state[attempt_key] = curr_attempts + 1
 
+                            # Track attempt history for candidate review
+                            attempts_hist = st.session_state.setdefault("all_attempts_history", {})
+                            q_attempts = attempts_hist.setdefault(feedback_key, [])
+                            q_attempts.append({
+                                "attempt": curr_attempts + 1,
+                                "answer": candidate_answer.strip(),
+                                "score": feedback.get("score", 0),
+                                "time": time.strftime("%H:%M"),
+                            })
+
                             # Record input to user account profile
                             record_user_answer_input(
                                 question=question.get("question", ""),
@@ -973,11 +1063,28 @@ elif selected_page == "Interview Practice":
                     st.divider()
                     render_answer_feedback(saved_feedback)
 
-        with st.expander("Company research"):
+                    # View past attempts if candidate answered multiple times
+                    past_attempts = st.session_state.get("all_attempts_history", {}).get(feedback_key, [])
+                    if len(past_attempts) > 1:
+                        with st.expander(f"📜 View past attempts ({len(past_attempts)} total)"):
+                            for p_att in past_attempts[:-1]:
+                                st.markdown(f"**Attempt #{p_att['attempt']}** · Score: `{p_att['score']}/10` · *{p_att.get('time', '')}*")
+                                st.caption(p_att["answer"][:300] + ("..." if len(p_att["answer"]) > 300 else ""))
+                                st.divider()
+
+                    if st.button("🧠 Practise adaptive follow-up for this question →", key=f"quick_followup_{index}"):
+                        st.session_state["_selected_followup_question_idx"] = index
+                        navigate_to("Adaptive Follow-ups")
+
+        skill_report = st.session_state.skill_gap_report or result.get("skill_gap_report")
+        if skill_report:
+            with st.expander("📊 Resume–JD Skill Alignment & Evidence (Analyzed in Session)", expanded=False):
+                render_skill_gap_report(skill_report)
+        with st.expander("🌐 Company research", expanded=False):
             st.markdown(result.get("company_research", "No company research was returned."))
-        with st.expander("Extracted job information"):
+        with st.expander("📋 Extracted job information", expanded=False):
             st.json(result.get("job_info", {}))
-        with st.expander("Resume processing summary"):
+        with st.expander("📄 Resume processing summary", expanded=False):
             st.success("Resume text extracted successfully.")
             st.write("Extracted characters:", len(result.get("resume_text", "")))
     else:
@@ -985,59 +1092,12 @@ elif selected_page == "Interview Practice":
 
 
 # ============================================================
-# 7. PAGE: SKILL GAP ANALYSIS
+# 7. ROUTING FALLBACK
 # ============================================================
 
 elif selected_page == "Skill Gap Analysis":
-    render_page_header(
-        "02 / UNDERSTAND YOUR MATCH",
-        "Resume–JD Skill Gap Analysis",
-        "Run this analysis separately whenever you want. It reuses the resume text and job requirements already extracted for your interview session.",
-    )
-
-    result = st.session_state.interview_result
-    if not result:
-        st.info("Create an interview session first. Skill-gap analysis uses the resume and job information from that session.")
-        if st.button("Go to interview practice →", type="primary"):
-            navigate_to("Interview Practice")
-    else:
-        st.markdown(
-            f"**Target company:** {result.get('company_name', '—')}  "
-            f"  \n**Role:** {result.get('job_info', {}).get('job_title', 'Role extracted from job description')}"
-        )
-        st.markdown("#### Run skill-gap analysis")
-        st.caption("This calls the Skill Gap Analyzer independently. It does not rerun company research, resume extraction or interview question generation.")
-
-        if st.button("🔍 Analyze my skill gap", type="primary", use_container_width=True):
-            st.session_state.skill_gap_report = None
-            st.session_state.skill_gap_error = None
-            try:
-                with st.spinner("Qwen is comparing your resume with the required skills..."):
-                    report = analyze_candidate_skill_gap(
-                        resume_text=result.get("resume_text", ""),
-                        job_info=result.get("job_info", {}),
-                    )
-                st.session_state.skill_gap_report = report
-                record_skill_analysis_run(company=result.get("company_name", ""))
-                save_session_cache(st.session_state)
-                st.success("Your skill-gap report is ready.")
-            except Exception as error:
-                st.session_state.skill_gap_error = f"{type(error).__name__}: {error}"
-                st.error("Skill-gap analysis could not be completed. Your interview session is still available.")
-
-        if st.session_state.skill_gap_error:
-            with st.expander("Technical error details"):
-                st.code(st.session_state.skill_gap_error)
-
-        if st.session_state.skill_gap_report:
-            st.divider()
-            render_skill_gap_report(st.session_state.skill_gap_report)
-        else:
-            st.markdown(
-                '<div class="ps-card"><div class="ps-card-title">What this analysis provides</div>'
-                '<div class="ps-card-copy">A skill-by-skill classification, explanation, exact resume evidence when available, and recommendations for partial or missing skills.</div></div>',
-                unsafe_allow_html=True,
-            )
+    navigate_to("Interview Practice")
+    st.rerun()
 
 
 # ============================================================
@@ -1065,6 +1125,11 @@ elif selected_page == "Performance Analytics":
             render_stat("TOTAL INTERVIEWS", acc_stats.get("total_interviews", 0))
         with p_col4:
             render_stat("LIFETIME AVG", f"{acc_stats.get('average_score', 0.0)}/10" if acc_stats.get("scores_history") else "—")
+
+    rep_btn_col1, rep_btn_col2 = st.columns([2.5, 1.5])
+    with rep_btn_col2:
+        if st.button("📄 Generate & Export PDF Report →", key="perf_export_report_btn", use_container_width=True):
+            navigate_to("Interview Report")
 
     evaluations = get_current_evaluations()
     if not evaluations:
@@ -1119,6 +1184,29 @@ elif selected_page == "Performance Analytics":
                 st.write(item.get("question", "Question unavailable"))
                 st.progress(min(max(float(item.get("score", 0)) / 10, 0.0), 1.0))
 
+    recent_activity = active_account.get("recent_activity", [])
+    if recent_activity:
+        st.markdown("### 📜 Candidate activity history")
+        with st.expander(f"View activity history for {active_account.get('name', 'Candidate')} ({len(recent_activity)} events)", expanded=False):
+            for act in recent_activity[:20]:
+                atype = act.get("type", act.get("action", "Activity")).replace("_", " ").title()
+                atime = act.get("timestamp", "")[:16].replace("T", " ")
+                detail_str = ""
+                if "company" in act:
+                    detail_str += f"Company: **{act['company']}** "
+                if "role" in act and act["role"]:
+                    detail_str += f"· Role: *{act['role']}* "
+                if "question" in act:
+                    detail_str += f"· Question: *{act['question']}...* "
+                if "score" in act:
+                    detail_str += f"· Score: `{act['score']}/10` "
+                if "challenge" in act:
+                    detail_str += f"· Challenge: **{act['challenge']}** ({'Passed' if act.get('all_passed') else 'Needs Work'}) "
+                if "detail" in act:
+                    detail_str += f"· {act['detail']} "
+                st.markdown(f"**{atype}** · `{atime}`  \n{detail_str}")
+                st.divider()
+
 
 # ============================================================
 # 9. PAGE: LEARNING ROADMAP
@@ -1131,22 +1219,25 @@ elif selected_page == "Learning Roadmap":
         "Turn identified skill gaps and target role requirements into an actionable, phased preparation roadmap.",
     )
 
-    report = st.session_state.skill_gap_report
     result = st.session_state.interview_result
+    report = st.session_state.skill_gap_report or (result.get("skill_gap_report") if result else None)
 
     if not report and not result:
-        st.info("No interview or skill-gap data found yet. Generate an interview session first to unlock your personalized learning roadmap.")
-        col_btn1, col_btn2 = st.columns([1, 1])
-        with col_btn1:
-            if st.button("🎯 Build interview session →", type="primary", use_container_width=True):
-                navigate_to("Interview Practice")
-        with col_btn2:
-            if st.button("🔍 Open skill gap analysis →", use_container_width=True):
-                navigate_to("Skill Gap Analysis")
+        st.info("No interview session found yet. Generate an interview session first to unlock your personalized learning roadmap.")
+        if st.button("🎯 Build interview session →", type="primary"):
+            navigate_to("Interview Practice")
     elif not report and result:
-        st.warning("Your interview session is ready, but skill-gap analysis has not been run yet.")
-        if st.button("🔍 Run skill-gap analysis now →", type="primary"):
-            navigate_to("Skill Gap Analysis")
+        st.info("Preparing skill alignment data for your learning roadmap...")
+        try:
+            with st.spinner("Analyzing skill match from your active session..."):
+                report = analyze_candidate_skill_gap(
+                    resume_text=result.get("resume_text", ""),
+                    job_info=result.get("job_info", {}),
+                )
+                st.session_state.skill_gap_report = report
+                st.rerun()
+        except Exception as err:
+            st.error(f"Could not prepare skill gap data: {err}")
     else:
         company = (result.get("company_name") if result else "") or "Target Company"
         job_info = (result.get("job_info") if result else {}) or {}
@@ -1303,88 +1394,314 @@ elif selected_page == "Learning Roadmap":
 
 
 # ============================================================
-# 10. PAGE: ADAPTIVE FOLLOW-UPS (FRONTEND PREVIEW)
+# 10. PAGE: ADAPTIVE FOLLOW-UPS
 # ============================================================
 
 elif selected_page == "Adaptive Follow-ups":
     render_page_header(
         "05 / GO ONE LEVEL DEEPER",
         "Adaptive Follow-up Questions",
-        "A follow-up question should respond to what you actually said—not just repeat another question from a fixed list.",
+        "An interviewer responds directly to what you said—probing technical trade-offs, edge cases, and architectural choices.",
     )
 
-    st.markdown('<span class="ps-coming-soon">Frontend ready · backend pending</span>', unsafe_allow_html=True)
     result = st.session_state.interview_result
     if not result:
-        st.info("Generate an interview session first to preview adaptive follow-ups against your questions.")
+        st.info("Generate an interview session first to practice adaptive follow-ups against your questions.")
         if st.button("Go to interview practice →", type="primary"):
             navigate_to("Interview Practice")
     else:
         questions = result.get("questions", [])
-        if questions:
+        if not questions:
+            st.info("No questions in this interview session yet.")
+        else:
             labels = [f"Q{index + 1}: {item.get('question', '')[:95]}" for index, item in enumerate(questions)]
-            selected_index = st.selectbox("Choose a question to build on", range(len(labels)), format_func=lambda value: labels[value])
-            selected_question = questions[selected_index]
-            st.markdown("#### Selected interview question")
-            st.info(selected_question.get("question", ""))
-            answer_text = st.text_area(
-                "Candidate response (preview)",
-                placeholder="This area will pass your response to the adaptive follow-up agent.",
-                height=130,
-                key="adaptive_followup_answer_preview",
+            default_q_idx = st.session_state.get("_selected_followup_question_idx", 0)
+            if default_q_idx >= len(labels):
+                default_q_idx = 0
+
+            selected_index = st.selectbox(
+                "Choose an interview question to build on",
+                range(len(labels)),
+                index=default_q_idx,
+                format_func=lambda value: labels[value],
             )
-            st.button("Generate adaptive follow-up", disabled=True, use_container_width=True)
-            st.caption("The adaptive-question agent is not connected yet. This page defines the planned interaction; it does not generate an AI follow-up at this stage.")
-            with st.expander("Planned follow-up behaviour"):
-                st.write("The backend will inspect the question, your answer, the role requirements and previous conversation context, then ask one targeted follow-up to probe reasoning, practical detail or an unexplained claim.")
+            selected_question = questions[selected_index]
+            q_text = selected_question.get("question", "")
+            q_type = selected_question.get("type", "technical")
+            i_id = st.session_state.get("interview_id", 0)
+            followup_state_key = f"followup_{i_id}_{selected_index}"
+
+            st.markdown("#### Original interview question")
+            st.info(f"**[{q_type.upper()}]** {q_text}")
+
+            # Check if answer was previously drafted or evaluated in Interview Practice
+            practice_answer_key = f"candidate_answer_{i_id}_{selected_index}"
+            prefill_answer = st.session_state.get(practice_answer_key, "")
+
+            answer_text = st.text_area(
+                "Your original answer (review or refine before probing)",
+                value=prefill_answer,
+                placeholder="Paste or write your answer here so the interviewer can evaluate your claims...",
+                height=130,
+                key=f"adaptive_followup_answer_input_{selected_index}",
+            )
+
+            col_gen, col_clear = st.columns([2, 1])
+            with col_gen:
+                gen_clicked = st.button("🧠 Generate targeted follow-up question", type="primary", use_container_width=True)
+            with col_clear:
+                if st.button("Reset follow-up", use_container_width=True):
+                    st.session_state.adaptive_followups.pop(followup_state_key, None)
+                    st.rerun()
+
+            if gen_clicked:
+                if not answer_text.strip():
+                    st.warning("Please provide an answer first so the interviewer has context to probe.")
+                else:
+                    with st.spinner("Interviewer is analyzing your response and formulating a targeted follow-up..."):
+                        followup_data = generate_adaptive_followup(
+                            original_question=q_text,
+                            candidate_answer=answer_text.strip(),
+                            job_context=result.get("job_info", {}).get("job_title", ""),
+                            question_type=q_type,
+                            company=result.get("company_name", ""),
+                        )
+                        st.session_state.adaptive_followups[followup_state_key] = followup_data
+                        record_adaptive_followup(
+                            original_question=q_text,
+                            followup_question=followup_data.get("followup_question", ""),
+                        )
+                        save_session_cache(st.session_state)
+
+            current_followup = st.session_state.adaptive_followups.get(followup_state_key)
+            if current_followup:
+                st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.markdown(f"#### 🎯 Interviewer Follow-up · *{current_followup.get('probe_focus', 'Technical Depth')}*")
+                    st.markdown(f"### {current_followup.get('followup_question')}")
+                    st.caption(f"**Why the interviewer asks this:** {current_followup.get('reasoning')}")
+
+                    with st.expander("💡 Suggested response structure & key points"):
+                        st.write(current_followup.get("suggested_approach", ""))
+
+                st.markdown("#### Your response to the follow-up")
+                fu_ans_key = f"fu_resp_{i_id}_{selected_index}"
+                fu_answer = st.text_area(
+                    "Answer the follow-up question",
+                    height=130,
+                    placeholder="Address the specific edge case, trade-off, or failure condition probed above...",
+                    key=fu_ans_key,
+                )
+
+                if st.button("Evaluate follow-up response", type="primary", key=f"btn_eval_fu_{selected_index}"):
+                    if not fu_answer.strip():
+                        st.warning("Please write an answer before evaluating.")
+                    else:
+                        with st.spinner("Evaluating your follow-up answer against the rubric..."):
+                            fu_eval = evaluate_answer(
+                                question=current_followup.get("followup_question", ""),
+                                answer=fu_answer.strip(),
+                                job_context=result.get("job_info", {}).get("job_title", ""),
+                                question_type=q_type,
+                            )
+                            st.session_state[f"fu_eval_{i_id}_{selected_index}"] = fu_eval
+                            record_user_answer_input(
+                                question=current_followup.get("followup_question", "")[:80],
+                                score=fu_eval.get("score", 7),
+                                company=result.get("company_name", ""),
+                            )
+                            save_session_cache(st.session_state)
+
+                saved_fu_eval = st.session_state.get(f"fu_eval_{i_id}_{selected_index}")
+                if saved_fu_eval:
+                    st.divider()
+                    render_answer_feedback(saved_fu_eval)
 
 
 # ============================================================
-# 11. PAGE: CODING INTERVIEW (FRONTEND PREVIEW)
+# 11. PAGE: CODING INTERVIEW
 # ============================================================
 
 elif selected_page == "Coding Interview":
     render_page_header(
         "06 / PRACTISE YOUR PROBLEM SOLVING",
-        "Coding Interview",
-        "A dedicated space for role-relevant coding challenges, code submission and structured evaluation.",
+        "Coding Interview Workspace",
+        "Solve algorithmic coding challenges with real in-browser test case execution and Senior Staff AI code reviews.",
     )
 
-    st.markdown('<span class="ps-coming-soon">Frontend ready · backend pending</span>', unsafe_allow_html=True)
+    challenge_keys = list(CODING_CHALLENGES.keys())
+    challenge_titles = [CODING_CHALLENGES[k]["title"] for k in challenge_keys]
+
     code_left, code_right = st.columns([1, 1.35], gap="large")
+
     with code_left:
         st.markdown("### Challenge setup")
-        difficulty = st.selectbox("Difficulty", ["Easy", "Medium", "Hard"], index=1)
-        language = st.selectbox("Programming language", ["Python", "C++", "Java", "JavaScript"])
-        challenge = st.selectbox("Sample challenge", ["Two Sum", "Valid Parentheses", "Merge Intervals"])
-        st.markdown("### Problem")
-        if challenge == "Two Sum":
-            st.write("Given an array of integers and a target, return the indices of two numbers that add up to the target.")
-            st.code("Input: nums = [2, 7, 11, 15], target = 9\nOutput: [0, 1]")
-        elif challenge == "Valid Parentheses":
-            st.write("Given a string containing brackets, determine whether the bracket sequence is valid.")
-            st.code('Input: s = "()[]{}"\nOutput: true')
-        else:
-            st.write("Given a list of intervals, merge all overlapping intervals.")
-            st.code("Input: [[1,3],[2,6],[8,10]]\nOutput: [[1,6],[8,10]]")
-        st.caption(f"Selected difficulty: {difficulty}")
+        selected_title_idx = st.selectbox(
+            "Select coding challenge",
+            range(len(challenge_titles)),
+            format_func=lambda idx: challenge_titles[idx],
+        )
+        selected_cid = challenge_keys[selected_title_idx]
+        challenge_meta = CODING_CHALLENGES[selected_cid]
+
+        diff = challenge_meta["difficulty"]
+        diff_color = "#2e7d32" if diff == "Easy" else ("#ed6c02" if diff == "Medium" else "#d32f2f")
+        st.markdown(
+            f"<span style='background:{diff_color}22; color:{diff_color}; padding:3px 10px; border-radius:12px; font-weight:600; font-size:12px;'>"
+            f"{diff.upper()}</span> · **{challenge_meta['category']}**",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("### Problem statement")
+        st.write(challenge_meta["description"])
+
+        st.markdown("### Examples")
+        for ex in challenge_meta["examples"]:
+            st.code(f"Input: {ex['input']}\nOutput: {ex['output']}")
 
     with code_right:
-        st.markdown("### Code workspace")
-        starter_code = "# Write your solution here\n\ndef solve():\n    pass\n"
-        st.text_area("Your code", value=starter_code, height=350, key="coding_editor_preview")
-        run_col, submit_col = st.columns(2)
-        with run_col:
-            st.button("▶ Run code", disabled=True, use_container_width=True)
-        with submit_col:
-            st.button("Submit solution", disabled=True, use_container_width=True, type="primary")
-        st.caption(f"Language selected: {language}. Code execution, test cases and AI code review are not connected yet.")
+        st.markdown("### Solution workspace (Python 3)")
+        saved_code = st.session_state.coding_sessions.get(selected_cid, challenge_meta["starter_code"])
+        user_code = st.text_area(
+            "Code editor",
+            value=saved_code,
+            height=320,
+            key=f"editor_{selected_cid}",
+        )
+        st.session_state.coding_sessions[selected_cid] = user_code
 
-    st.info("The frontend includes challenge selection and an editor preview. A sandboxed code runner and evaluator must be connected before code can execute or be scored.")
+        btn_col1, btn_col2, btn_col3 = st.columns([1.2, 1.5, 1])
+        with btn_col1:
+            run_clicked = st.button("▶ Run test cases", use_container_width=True)
+        with btn_col2:
+            submit_clicked = st.button("🚀 Submit & Review", type="primary", use_container_width=True)
+        with btn_col3:
+            if st.button("Reset code", use_container_width=True):
+                st.session_state.coding_sessions[selected_cid] = challenge_meta["starter_code"]
+                st.session_state.coding_test_results.pop(selected_cid, None)
+                st.session_state.coding_reviews.pop(selected_cid, None)
+                st.rerun()
+
+        # Handle Execution
+        if run_clicked or submit_clicked:
+            with st.spinner("Executing solution against test cases..."):
+                exec_result = run_coding_test_cases(user_code, selected_cid)
+                st.session_state.coding_test_results[selected_cid] = exec_result
+
+            if submit_clicked:
+                with st.spinner("Generating Senior Staff code review (complexity, edge cases, clean code)..."):
+                    review_result = review_code_solution(user_code, selected_cid, exec_result)
+                    st.session_state.coding_reviews[selected_cid] = review_result
+                    record_coding_challenge_completed(
+                        challenge_title=challenge_meta["title"],
+                        all_passed=exec_result.get("all_passed", False),
+                        quality_score=review_result.get("quality_score", 7),
+                    )
+                    save_session_cache(st.session_state)
+
+        # Display Test Execution Results
+        test_res = st.session_state.coding_test_results.get(selected_cid)
+        if test_res:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            if test_res.get("error"):
+                st.error(test_res["error"])
+            else:
+                passed_cnt = test_res.get("passed_count", 0)
+                tot_cnt = test_res.get("total_count", 0)
+                if test_res.get("all_passed"):
+                    st.success(f"🎉 **Accepted!** Passed all {tot_cnt}/{tot_cnt} test cases.")
+                else:
+                    st.warning(f"⚠️ **Partially passing:** {passed_cnt}/{tot_cnt} test cases passed.")
+
+                with st.expander("🔍 Inspect individual test case runs", expanded=not test_res.get("all_passed")):
+                    for tc in test_res.get("results", []):
+                        status_badge = "✅ PASS" if tc["passed"] else "❌ FAIL"
+                        st.markdown(
+                            f"**Test Case #{tc['test_case']}** · {status_badge} · *Runtime: {tc['runtime_ms']}ms*"
+                        )
+                        st.caption(f"Input: `{tc['input']}` | Expected: `{tc['expected']}` | Output: `{tc['got']}`")
+                        if tc.get("error"):
+                            st.caption(f"Error: `{tc['error']}`")
+                        st.divider()
+
+        # Display AI Code Review
+        review_data = st.session_state.coding_reviews.get(selected_cid)
+        if review_data:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            with st.container(border=True):
+                r_col1, r_col2, r_col3 = st.columns(3)
+                with r_col1:
+                    render_stat("TIME COMPLEXITY", review_data.get("time_complexity", "O(N)"))
+                with r_col2:
+                    render_stat("SPACE COMPLEXITY", review_data.get("space_complexity", "O(1)"))
+                with r_col3:
+                    render_stat("CODE QUALITY", f"{review_data.get('quality_score', 8)}/10")
+
+                st.markdown(f"**Verdict:** {review_data.get('overall_verdict', '')}")
+
+                s_col, i_col = st.columns(2)
+                with s_col:
+                    st.markdown("##### ✅ Strengths")
+                    for s in review_data.get("strengths", []):
+                        st.markdown(f"- {s}")
+                with i_col:
+                    st.markdown("##### 💡 Suggestions")
+                    for imp in review_data.get("improvements", []):
+                        st.markdown(f"- {imp}")
 
 
 # ============================================================
-# 12. GLOBAL FOOTER
+# 12. PAGE: INTERVIEW REPORT
+# ============================================================
+
+elif selected_page == "Interview Report":
+    render_page_header(
+        "07 / CANDIDATE DOSSIER",
+        "Candidate Interview Report",
+        "Generate and export a comprehensive, print-ready dossier covering interview scores, skill alignment, rubric breakdowns, and learning roadmap.",
+    )
+
+    account = get_active_account()
+    result = st.session_state.interview_result
+    skill_gap_report = st.session_state.skill_gap_report or (result.get("skill_gap_report") if result else None)
+    evaluation_history = st.session_state.get("evaluation_history", {})
+    answer_feedback = st.session_state.get("answer_feedback", {})
+    roadmap = st.session_state.get("learning_roadmap")
+
+    report_html = build_report_html(
+        account=account,
+        result=result,
+        skill_gap_report=skill_gap_report,
+        evaluation_history=evaluation_history,
+        answer_feedback=answer_feedback,
+        roadmap=roadmap,
+    )
+    report_filename = build_report_filename(account=account, result=result)
+
+    with st.container(border=True):
+        st.markdown("### 📥 Export Candidate Report")
+        st.caption("Your report is packaged as a print-optimized document. Download the file, open it in any browser, and select Print → Save as PDF.")
+
+        btn_col1, btn_col2 = st.columns([1.5, 2])
+        with btn_col1:
+            st.download_button(
+                label="📄 Download Report (HTML / Print to PDF)",
+                data=report_html,
+                file_name=report_filename,
+                mime="text/html",
+                type="primary",
+                use_container_width=True,
+            )
+        with btn_col2:
+            st.info("💡 **How to Save as PDF:** Open the downloaded HTML file in your web browser, press `Ctrl + P` (or `Cmd + P` on Mac), select **'Save as PDF'**, and click Save.")
+
+    st.markdown("### 👁️ Live Dossier Preview")
+    import streamlit.components.v1 as components
+    components.html(report_html, height=750, scrolling=True)
+
+
+# ============================================================
+# 13. GLOBAL FOOTER
 # ============================================================
 
 render_footer()

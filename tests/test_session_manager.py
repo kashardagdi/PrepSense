@@ -51,6 +51,33 @@ class TestSessionManager(unittest.TestCase):
         self.assertFalse(_get_cache_file().exists())
         self.assertIsNone(load_session_cache())
 
+    def test_per_user_session_isolation(self):
+        state_alice = {
+            "interview_id": 101,
+            "interview_result": {"company_name": "Netflix"},
+            "candidate_answer_101_1": "Alice's answer",
+        }
+        state_bob = {
+            "interview_id": 202,
+            "interview_result": {"company_name": "Apple"},
+            "candidate_answer_202_1": "Bob's answer",
+        }
+
+        save_session_cache(state_alice, user_id="alice")
+        save_session_cache(state_bob, user_id="bob")
+
+        loaded_alice = load_session_cache(user_id="alice")
+        loaded_bob = load_session_cache(user_id="bob")
+
+        self.assertIsNotNone(loaded_alice)
+        self.assertIsNotNone(loaded_bob)
+        self.assertEqual(loaded_alice["interview_result"]["company_name"], "Netflix")
+        self.assertEqual(loaded_bob["interview_result"]["company_name"], "Apple")
+        self.assertNotEqual(loaded_alice["interview_id"], loaded_bob["interview_id"])
+
+        clear_session_cache(user_id="alice")
+        clear_session_cache(user_id="bob")
+
 
 if __name__ == "__main__":
     unittest.main()

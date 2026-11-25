@@ -334,10 +334,160 @@ def deduplicate_questions(questions: list) -> list:
 
 
 
+def synthesize_missing_questions(
+    current_questions: list,
+    job_info: dict,
+    company_research: str = "",
+    expected_technical: int = 5,
+    expected_behavioral: int = 3,
+) -> list:
+    """
+    Synthesize high-quality role-relevant questions to fill any missing slots
+    so the question set strictly satisfies exactly 5 technical and 3 behavioral questions.
+    """
+    seen = {
+        re.sub(r"\s+", " ", q.get("question", "").strip().lower())
+        for q in current_questions
+        if isinstance(q, dict) and q.get("question")
+    }
+
+    technical_questions = [
+        q for q in current_questions
+        if isinstance(q, dict) and q.get("type") == "technical"
+    ]
+    behavioral_questions = [
+        q for q in current_questions
+        if isinstance(q, dict) and q.get("type") == "behavioral"
+    ]
+
+    needed_technical = expected_technical - len(technical_questions)
+    needed_behavioral = expected_behavioral - len(behavioral_questions)
+
+    # 1. Fill missing technical questions
+    if needed_technical > 0:
+        skills = []
+        if isinstance(job_info, dict):
+            raw_tech = job_info.get("technical_skills", [])
+            raw_tools = job_info.get("tools_and_technologies", [])
+            if isinstance(raw_tech, list):
+                skills.extend(raw_tech)
+            if isinstance(raw_tools, list):
+                skills.extend(raw_tools)
+
+        role = (job_info.get("job_title") if isinstance(job_info, dict) else "") or "Software Engineer"
+
+        skill_templates = [
+            ("python", "Can you explain how Python manages memory with its private heap, reference counting, and cyclic garbage collector, and when you would prefer generators over lists for large-scale data processing?"),
+            ("sql", "How do you design database schemas for high write throughput, and how do you analyze query execution plans to identify and eliminate full table scans?"),
+            ("database", "When designing a persistent storage layer, how do you decide between relational (ACID) and NoSQL (eventual consistency) databases for specific data access patterns?"),
+            ("rest", "What architectural principles and HTTP conventions do you follow when designing production RESTful APIs to ensure idempotency, rate limiting, and robust error responses?"),
+            ("api", "How do you design and version internal and external APIs to ensure backward compatibility and prevent breaking downstream consumers?"),
+            ("data structure", "Describe how you select between different data structures (e.g., Hash Map, Heap, Balanced BST, Trie) when building a high-throughput search or ranking service."),
+            ("algorithm", "How do you evaluate and optimize the time and space complexity of an algorithm under real-world constraints, such as limited memory or streaming inputs?"),
+            ("oop", "How do you apply Object-Oriented Programming (OOP) principles and design patterns (such as Factory, Strategy, or Observer) to build maintainable, decoupled systems?"),
+            ("object-oriented", "Explain how encapsulation, polymorphism, and composition over inheritance help reduce tight coupling in complex software architectures."),
+            ("git", "Describe your preferred Git branching and release strategy in a CI/CD environment, and how you resolve complex merge conflicts without losing work."),
+            ("docker", "How do you optimize Docker images for production (e.g., multi-stage builds, minimal base images) and manage container secrets securely?"),
+            ("kubernetes", "In a microservices deployment on Kubernetes, how do you handle pod health checks, rolling updates, and graceful service shutdowns?"),
+            ("java", "Can you explain the Java Memory Model, how the Garbage Collector manages generations, and how you diagnose thread contention or memory leaks?"),
+            ("c++", "How do modern C++ features (such as RAII, smart pointers, move semantics, and rvalue references) prevent resource leaks and improve execution speed?"),
+            ("go", "How do Go's goroutines and channels differ from traditional OS threads, and how do you prevent goroutine leaks in high-concurrency applications?"),
+            ("system design", "How do you design a scalable distributed system to handle sudden 10x traffic spikes while maintaining sub-100ms p99 latency?"),
+            ("debugging", "Walk me through your methodology for isolating and debugging a sporadic, non-reproducible concurrency bug or memory leak in production."),
+            ("testing", "What is your testing philosophy across unit, integration, and end-to-end tests, and how do you ensure high test confidence without brittle test suites?"),
+        ]
+
+        # Prioritize matching skills from job requirements
+        for skill_kw, q_text in skill_templates:
+            if needed_technical <= 0:
+                break
+            norm_q = re.sub(r"\s+", " ", q_text.strip().lower())
+            if norm_q not in seen:
+                skill_match = any(skill_kw in str(s).lower() for s in skills)
+                if skill_match:
+                    technical_questions.append({
+                        "question": q_text,
+                        "type": "technical",
+                        "reason": f"Evaluates core technical proficiency with {skill_kw.title()}.",
+                    })
+                    seen.add(norm_q)
+                    needed_technical -= 1
+
+        # Fill remaining technical from general templates
+        for skill_kw, q_text in skill_templates:
+            if needed_technical <= 0:
+                break
+            norm_q = re.sub(r"\s+", " ", q_text.strip().lower())
+            if norm_q not in seen:
+                technical_questions.append({
+                    "question": q_text,
+                    "type": "technical",
+                    "reason": f"Evaluates practical engineering depth relevant to {role}.",
+                })
+                seen.add(norm_q)
+                needed_technical -= 1
+
+        # Dynamic fallback if still needed
+        idx = 1
+        while needed_technical > 0:
+            dyn_q = f"Describe a complex technical challenge you solved in a past project related to {role}. What trade-offs did you make and what was the outcome? (Question {idx})"
+            norm_q = re.sub(r"\s+", " ", dyn_q.strip().lower())
+            if norm_q not in seen:
+                technical_questions.append({
+                    "question": dyn_q,
+                    "type": "technical",
+                    "reason": f"Evaluates architectural problem-solving depth for {role}.",
+                })
+                seen.add(norm_q)
+                needed_technical -= 1
+            idx += 1
+
+    # 2. Fill missing behavioral questions
+    if needed_behavioral > 0:
+        star_templates = [
+            ("Tell me about a time you had a technical disagreement with a teammate or lead. How did you present your perspective, listen to theirs, and reach a constructive consensus?", "Evaluates conflict resolution, technical diplomacy, and teamwork."),
+            ("Describe a situation where you had to deliver a critical project under tight deadlines with competing or ambiguous requirements. How did you prioritize your work?", "Evaluates prioritization, time management, and resilience under pressure."),
+            ("Can you share an example of a technical decision or project that didn't go as planned? What was the root cause, how did you handle recovery, and what systemic lessons did you take away?", "Evaluates humility, root cause analysis, and post-mortem learning."),
+            ("Tell me about a time you noticed an inefficiency, security gap, or technical debt in a codebase and took the initiative to resolve it without being explicitly instructed.", "Evaluates proactive ownership and engineering craft."),
+            ("Describe a scenario where you had to quickly learn an unfamiliar technology, language, or domain to deliver a key feature. What was your strategy for ramping up effectively?", "Evaluates continuous learning and adaptability in high-velocity environments."),
+            ("Tell me about a time you received constructive criticism on your code review or system architecture. How did you incorporate the feedback?", "Evaluates receptiveness to feedback and collaboration in code reviews."),
+        ]
+
+        for q_text, reason in star_templates:
+            if needed_behavioral <= 0:
+                break
+            norm_q = re.sub(r"\s+", " ", q_text.strip().lower())
+            if norm_q not in seen:
+                behavioral_questions.append({
+                    "question": q_text,
+                    "type": "behavioral",
+                    "reason": reason,
+                })
+                seen.add(norm_q)
+                needed_behavioral -= 1
+
+        idx = 1
+        while needed_behavioral > 0:
+            dyn_q = f"Describe a situation where cross-team communication was critical to the success of a feature you worked on. How did you coordinate effectively? (Behavioral {idx})"
+            norm_q = re.sub(r"\s+", " ", dyn_q.strip().lower())
+            if norm_q not in seen:
+                behavioral_questions.append({
+                    "question": dyn_q,
+                    "type": "behavioral",
+                    "reason": "Evaluates cross-functional collaboration and clear communication.",
+                })
+                seen.add(norm_q)
+                needed_behavioral -= 1
+            idx += 1
+
+    return technical_questions[:expected_technical] + behavioral_questions[:expected_behavioral]
+
+
 def generate_questions(
     job_info: dict,
     company_research: str,
     resume_text: str = "",
+    allow_fallback: bool = False,
 ) -> list:
     """
     Generate exactly 5 technical and 3 behavioral
@@ -560,16 +710,30 @@ Return ONLY valid JSON:
             )
 
     # ----------------------------------------------
-    # 6. Final strict validation
+    # 6. Final strict validation & fallback guarantee
     # ----------------------------------------------
 
     if counts != expected:
-        raise ValueError(
-            "Question generation could not satisfy the required "
-            "distribution after repair. "
-            f"Received {counts['technical']} technical and "
-            f"{counts['behavioral']} behavioral questions."
-        )
+        if allow_fallback:
+            print(
+                f"\n[Generator Fallback] Question set incomplete after repair: "
+                f"{counts['technical']}/5 technical, {counts['behavioral']}/3 behavioral. "
+                "Synthesizing missing questions from role requirements to guarantee complete interview set..."
+            )
+            questions = synthesize_missing_questions(
+                current_questions=questions,
+                job_info=job_info,
+                company_research=company_research,
+                expected_technical=expected["technical"],
+                expected_behavioral=expected["behavioral"],
+            )
+        else:
+            raise ValueError(
+                "Question generation could not satisfy the required "
+                "distribution after repair. "
+                f"Received {counts['technical']} technical and "
+                f"{counts['behavioral']} behavioral questions."
+            )
 
     questions = validate_question_set(questions)
 

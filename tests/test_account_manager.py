@@ -1,24 +1,32 @@
+import tempfile
+from pathlib import Path
 import unittest
+from unittest.mock import patch
+import account_manager
 from account_manager import (
     load_accounts_db,
     save_accounts_db,
     get_active_account,
+    get_all_accounts,
+    update_account_profile,
     switch_or_create_account,
     record_user_answer_input,
     record_interview_created,
-    _get_accounts_file,
 )
 
 
 class TestAccountManager(unittest.TestCase):
     def setUp(self):
-        self.accounts_file = _get_accounts_file()
-        if self.accounts_file.exists():
-            self.accounts_file.unlink()
+        self.temp_file = Path(tempfile.gettempdir()) / f"test_prepsense_accounts_{id(self)}.json"
+        if self.temp_file.exists():
+            self.temp_file.unlink()
+        self.patcher = patch("account_manager._get_accounts_file", return_value=self.temp_file)
+        self.patcher.start()
 
     def tearDown(self):
-        if self.accounts_file.exists():
-            self.accounts_file.unlink()
+        self.patcher.stop()
+        if self.temp_file.exists():
+            self.temp_file.unlink()
 
     def test_default_account_creation(self):
         account = get_active_account()
@@ -33,6 +41,18 @@ class TestAccountManager(unittest.TestCase):
 
         active = get_active_account()
         self.assertEqual(active["id"], "john_doe")
+
+    def test_get_all_accounts_and_update_profile(self):
+        switch_or_create_account("cand1", "Candidate One", "Frontend Dev")
+        switch_or_create_account("cand2", "Candidate Two", "Cloud Architect")
+
+        all_acc = get_all_accounts()
+        self.assertIn("cand1", all_acc)
+        self.assertIn("cand2", all_acc)
+
+        updated = update_account_profile("cand1", name="Candidate Prime", target_role="Staff Frontend")
+        self.assertEqual(updated["name"], "Candidate Prime")
+        self.assertEqual(updated["target_role"], "Staff Frontend")
 
     def test_record_user_answer_input(self):
         switch_or_create_account("alice", "Alice")

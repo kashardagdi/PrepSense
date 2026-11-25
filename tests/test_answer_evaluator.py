@@ -68,6 +68,34 @@ class TestAnswerEvaluator(unittest.TestCase):
         self.assertGreaterEqual(result["score"], 7)
         self.assertIn("breakdown", result)
 
+    def test_discrimination_between_below_average_and_strong(self):
+        from answer_evaluator import evaluate_answer_heuristic
+        below_avg = "I know Python and SQL. In my project when queries were slow I checked the database and fixed them so it ran faster. It is very important to make sure code is good."
+        strong = "I analyzed slow query logs using EXPLAIN ANALYZE in PostgreSQL and identified missing composite B-Tree indexes on tenant_id and created_at. I added a Redis write-through cache with a 5-minute TTL to reduce read pressure, reducing p99 latency from 420ms to 28ms."
+
+        res_below = evaluate_answer_heuristic("How do you optimize slow database queries?", below_avg, "technical")
+        res_strong = evaluate_answer_heuristic("How do you optimize slow database queries?", strong, "technical")
+
+        self.assertLessEqual(res_below["score"], 5)
+        self.assertGreaterEqual(res_strong["score"], 8)
+        self.assertGreaterEqual(res_strong["score"] - res_below["score"], 3)
+
+    def test_discrimination_behavioral_answer(self):
+        from answer_evaluator import evaluate_answer_heuristic
+        below_avg_behavioral = "I had a disagreement with someone at work. We talked about it and resolved it. Communication is very important."
+        strong_behavioral = (
+            "When our primary payment webhook handler experienced intermittent timeout failures, I led the emergency response team as incident commander. "
+            "I isolated the bottleneck to unindexed database queries under concurrency, proposed an asynchronous retry queue using Redis, and coordinated "
+            "across three engineers to deploy the fix within 45 minutes. We eliminated 100% of webhook drops, saved $80k in transactions, and published a team runbook."
+        )
+
+        res_below = evaluate_answer_heuristic("Tell me about a time you handled a critical challenge.", below_avg_behavioral, "behavioral")
+        res_strong = evaluate_answer_heuristic("Tell me about a time you handled a critical challenge.", strong_behavioral, "behavioral")
+
+        self.assertLessEqual(res_below["score"], 4)
+        self.assertGreaterEqual(res_strong["score"], 8)
+        self.assertGreaterEqual(res_strong["score"] - res_below["score"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
